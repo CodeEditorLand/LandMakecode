@@ -1,385 +1,313 @@
 import * as vscode from "vscode";
-
-import {
-	activeWorkspace,
-	findFilesAsync,
-	readFileAsync,
-	writeFileAsync,
-} from "./host";
+import { activeWorkspace, findFilesAsync, readFileAsync, writeFileAsync } from "./host";
 import { syncJResAsync } from "./jres";
 import { readTextFileAsync, throttle } from "./util";
+import { getAssetEditorHtmlAsync } from "./makecodeOperations";
 
 let extensionContext: vscode.ExtensionContext;
 // const assetUrl = "http://localhost:3232/asseteditor.html";
-
 const assetUrl = "https://arcade.makecode.com/--asseteditor";
 
 interface EditingState {
-	type: "edit";
-
-	assetType: string;
-
-	assetId: string;
+    type: "edit";
+    assetType: string;
+    assetId: string;
 }
 
 interface DuplicatingState {
-	type: "duplicate";
-
-	assetType: string;
-
-	assetId: string;
+    type: "duplicate";
+    assetType: string;
+    assetId: string;
 }
 
 interface CreatingState {
-	type: "create";
-
-	assetType: string;
-
-	displayName?: string;
+    type: "create";
+    assetType: string;
+    displayName?: string;
 }
 
 type AssetEditorState = EditingState | DuplicatingState | CreatingState;
 
 export class AssetEditor {
-	public static readonly viewType = "mkcdasset";
+    public static readonly viewType = "mkcdasset";
+    public static currentEditor: AssetEditor | undefined;
+    public simStateTimer: any;
+    public throttledSave: (files: {
+        [index: string]: string;
+    }) => void = throttle(saveFilesAsync, 300);
 
-	public static currentEditor: AssetEditor | undefined;
+    public static createOrShow() {
+        let column = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : vscode.ViewColumn.One;
+        column = column! < 9 ? column! + 1 : column;
 
-	public simStateTimer: any;
+        if (AssetEditor.currentEditor) {
+            AssetEditor.currentEditor.panel.reveal(
+                undefined /** keep current column **/,
+                true
+            );
+            return;
+        }
 
-	public throttledSave: (files: { [index: string]: string }) => void =
-		throttle(saveFilesAsync, 300);
+        const panel = vscode.window.createWebviewPanel(AssetEditor.viewType, vscode.l10n.t("Microsoft MakeCode Asset Editor"), {
+            viewColumn: vscode.ViewColumn.Two,
+            preserveFocus: true,
+        }, {
+            // Enable javascript in the webview
+            enableScripts: true,
+            retainContextWhenHidden: true
+        });
 
-	public static createOrShow() {
-		let column = vscode.window.activeTextEditor
-			? vscode.window.activeTextEditor.viewColumn
-			: vscode.ViewColumn.One;
+        AssetEditor.currentEditor = new AssetEditor(panel);
+    }
 
-		column = column! < 9 ? column! + 1 : column;
+    public static register(context: vscode.ExtensionContext) {
+        extensionContext = context;
+        vscode.window.registerWebviewPanelSerializer('mkcdasset', new AssetEditorSerializer());
+    }
 
-		if (AssetEditor.currentEditor) {
-			AssetEditor.currentEditor.panel.reveal(
-				undefined /** keep current column **/,
-				true,
-			);
+    public static revive(panel: vscode.WebviewPanel) {
+        AssetEditor.currentEditor = new AssetEditor(panel);
+    }
 
-			return;
-		}
+    protected panel: vscode.WebviewPanel;
+    protected editing: AssetEditorState | undefined;
+    protected assetEditorHtml: string | undefined;
+    protected disposables: vscode.Disposable[];
+    protected pendingMessages: {[index: string]: (res: any) => void} = {};
+    protected nextId = 0;
 
-		const panel = vscode.window.createWebviewPanel(
-			AssetEditor.viewType,
-			vscode.l10n.t("Microsoft MakeCode Asset Editor"),
-			{
-				viewColumn: vscode.ViewColumn.Two,
-				preserveFocus: true,
-			},
-			{
-				// Enable javascript in the webview
-				enableScripts: true,
-				retainContextWhenHidden: true,
-			},
-		);
+    constructor(panel: vscode.WebviewPanel) {
+        this.panel = panel;
 
-		AssetEditor.currentEditor = new AssetEditor(panel);
-	}
+        this.panel.webview.onDidReceiveMessage(message => {
+            this.handleSimulatorMessage(message);
+        });
 
-	public static register(context: vscode.ExtensionContext) {
-		extensionContext = context;
+        this.panel.onDidDispose(() => {
+            if (AssetEditor.currentEditor === this) {
+                AssetEditor.currentEditor = undefined;
+            }
 
-		vscode.window.registerWebviewPanelSerializer(
-			"mkcdasset",
-			new AssetEditorSerializer(),
-		);
-	}
+            this.disposables.forEach(d => d.dispose());
+        });
 
-	public static revive(panel: vscode.WebviewPanel) {
-		AssetEditor.currentEditor = new AssetEditor(panel);
-	}
+        this.disposables = [];
+    }
 
-	protected panel: vscode.WebviewPanel;
+    async openURIAsync(uri: vscode.Uri) {
+        const parts = uri.path.split(".");
+        const assetType = parts[1];
+        const assetId = parts.slice(2).join(".");
+        await this.openAssetAsync(assetType, assetId);
+    }
 
-	protected editing: AssetEditorState | undefined;
+    async openAssetAsync(assetType: string, assetId: string) {
+        this.editing = {
+            type: "edit",
+            assetType,
+            assetId
+        };
 
-	protected disposables: vscode.Disposable[];
+        await this.initWebviewHtmlAsync();
+    }
 
-	protected pendingMessages: { [index: string]: (res: any) => void } = {};
+    async duplicateAssetAsync(assetType: string, assetId: string) {
+        this.editing = {
+            type: "duplicate",
+            assetType,
+            assetId
+        };
 
-	protected nextId = 0;
+        await this.initWebviewHtmlAsync();
+    }
 
-	constructor(panel: vscode.WebviewPanel) {
-		this.panel = panel;
+    async createAssetAsync(assetType: string, displayName?: string) {
+        this.editing = {
+            type: "create",
+            assetType,
+            displayName,
+        };
 
-		this.panel.webview.onDidReceiveMessage((message) => {
-			this.handleSimulatorMessage(message);
-		});
+        await this.initWebviewHtmlAsync();
+    }
 
-		this.panel.onDidDispose(() => {
-			if (AssetEditor.currentEditor === this) {
-				AssetEditor.currentEditor = undefined;
-			}
+    handleSimulatorMessage(message: any) {
+        if (this.pendingMessages[message.id]) {
+            this.pendingMessages[message.id](message);
+            delete this.pendingMessages[message.id];
+            return;
+        }
 
-			this.disposables.forEach((d) => d.dispose());
-		});
+        switch (message.type) {
+            case "fetch-html":
+                this.postMessageCore({
+                    type: "fetch-html",
+                    srcDoc: this.assetEditorHtml
+                });
+                break;
+            case "event":
+                this.handleSimulatorEventAsync(message);
+                break;
+        }
+    }
 
-		this.disposables = [];
-	}
+    async handleSimulatorEventAsync(message: any) {
+        switch (message.kind) {
+            case "ready":
+                await this.onReadyMessageReceivedAsync();
+                break;
+            case "done-clicked":
+                const saved = await this.sendMessageAsync({
+                    type: "save"
+                });
+                this.throttledSave(saved.files);
+                break;
+        }
+    }
 
-	async openURIAsync(uri: vscode.Uri) {
-		const parts = uri.path.split(".");
+    sendMessageAsync(message: any) {
+        message.id = this.nextId++;
 
-		const assetType = parts[1];
+        return new Promise<any>(resolve => {
+            this.pendingMessages[message.id] = resolve;
+            this.postMessageCore(message);
+        });
+    }
 
-		const assetId = parts.slice(2).join(".");
+    addDisposable(d: vscode.Disposable) {
+        this.disposables.push(d);
+    }
 
-		await this.openAssetAsync(assetType, assetId);
-	}
+    protected postMessageCore(message: any) {
+        message._fromVscode = true;
+        this.panel.webview.postMessage(message);
+    }
 
-	async openAssetAsync(assetType: string, assetId: string) {
-		this.editing = {
-			type: "edit",
-			assetType,
-			assetId,
-		};
+    protected async initWebviewHtmlAsync() {
+        this.panel.webview.html = "";
 
-		await this.initWebviewHtmlAsync();
-	}
+        this.assetEditorHtml = await getAssetEditorHtmlAsync(activeWorkspace());;
+        const simulatorHTML = await getAssetEditorLoaderHtmlAsync(this.panel.webview);
+        this.panel.webview.html = simulatorHTML;
+    }
 
-	async duplicateAssetAsync(assetType: string, assetId: string) {
-		this.editing = {
-			type: "duplicate",
-			assetType,
-			assetId,
-		};
+    protected async onReadyMessageReceivedAsync() {
+        if (!this.editing) {return;}
 
-		await this.initWebviewHtmlAsync();
-	}
-
-	async createAssetAsync(assetType: string, displayName?: string) {
-		this.editing = {
-			type: "create",
-			assetType,
-			displayName,
-		};
-
-		await this.initWebviewHtmlAsync();
-	}
-
-	handleSimulatorMessage(message: any) {
-		if (this.pendingMessages[message.id]) {
-			this.pendingMessages[message.id](message);
-
-			delete this.pendingMessages[message.id];
-
-			return;
-		}
-
-		switch (message.type) {
-			case "event":
-				this.handleSimulatorEventAsync(message);
-
-				break;
-		}
-	}
-
-	async handleSimulatorEventAsync(message: any) {
-		switch (message.kind) {
-			case "ready":
-				await this.onReadyMessageReceivedAsync();
-
-				break;
-
-			case "done-clicked":
-				const saved = await this.sendMessageAsync({
-					type: "save",
-				});
-
-				this.throttledSave(saved.files);
-
-				break;
-		}
-	}
-
-	sendMessageAsync(message: any) {
-		message._fromVscode = true;
-
-		message.id = this.nextId++;
-
-		return new Promise<any>((resolve) => {
-			this.pendingMessages[message.id] = resolve;
-
-			this.panel.webview.postMessage(message);
-		});
-	}
-
-	addDisposable(d: vscode.Disposable) {
-		this.disposables.push(d);
-	}
-
-	protected async initWebviewHtmlAsync() {
-		this.panel.webview.html = "";
-
-		const simulatorHTML = await getAssetEditorHtmlAsync(this.panel.webview);
-
-		this.panel.webview.html = simulatorHTML;
-	}
-
-	protected async onReadyMessageReceivedAsync() {
-		if (!this.editing) {
-			return;
-		}
-
-		switch (this.editing.type) {
-			case "edit":
-				this.sendMessageAsync({
-					type: "open",
-					assetType: this.editing.assetType,
-					assetId: this.editing.assetId,
-					files: await readProjectJResAsync(),
-					palette: await readProjectPaletteAsync(),
-				});
-
-				break;
-
-			case "duplicate":
-				this.sendMessageAsync({
-					type: "duplicate",
-					assetType: this.editing.assetType,
-					assetId: this.editing.assetId,
-					files: await readProjectJResAsync(),
-					palette: await readProjectPaletteAsync(),
-				});
-
-				break;
-
-			case "create":
-				this.sendMessageAsync({
-					type: "create",
-					displayName: this.editing.displayName,
-					assetType: this.editing.assetType,
-					files: await readProjectJResAsync(),
-					palette: await readProjectPaletteAsync(),
-				});
-
-				break;
-		}
-	}
+        switch (this.editing.type) {
+            case "edit":
+                this.sendMessageAsync({
+                    type: "open",
+                    assetType: this.editing.assetType,
+                    assetId: this.editing.assetId,
+                    files: await readProjectJResAsync(),
+                    palette: await readProjectPaletteAsync()
+                });
+                break;
+            case "duplicate":
+                this.sendMessageAsync({
+                    type: "duplicate",
+                    assetType: this.editing.assetType,
+                    assetId: this.editing.assetId,
+                    files: await readProjectJResAsync(),
+                    palette: await readProjectPaletteAsync()
+                });
+                break;
+            case "create":
+                this.sendMessageAsync({
+                    type: "create",
+                    displayName: this.editing.displayName,
+                    assetType: this.editing.assetType,
+                    files: await readProjectJResAsync(),
+                    palette: await readProjectPaletteAsync()
+                });
+                break;
+        }
+    }
 }
 
 export class AssetEditorSerializer implements vscode.WebviewPanelSerializer {
-	async deserializeWebviewPanel(
-		webviewPanel: vscode.WebviewPanel,
-		state: any,
-	) {
-		AssetEditor.revive(webviewPanel);
-
-		await AssetEditor.currentEditor?.openAssetAsync(
-			state.editing!.assetType,
-			state.editing!.assetId,
-		);
-	}
+    async deserializeWebviewPanel(webviewPanel: vscode.WebviewPanel, state: any) {
+        AssetEditor.revive(webviewPanel);
+        await AssetEditor.currentEditor?.openAssetAsync(state.editing!.assetType, state.editing!.assetId);
+    }
 }
 
-async function getAssetEditorHtmlAsync(webview: vscode.Webview) {
-	const uri = vscode.Uri.joinPath(
-		extensionContext.extensionUri,
-		"resources",
-		"assetframe.html",
-	);
 
-	const contents = await readTextFileAsync(uri);
+async function getAssetEditorLoaderHtmlAsync(webview: vscode.Webview) {
+    const uri = vscode.Uri.joinPath(extensionContext.extensionUri, "resources", "assetframe.html");
+    const contents = await readTextFileAsync(uri);
 
-	const pathURL = (s: string) =>
-		webview
-			.asWebviewUri(
-				vscode.Uri.joinPath(
-					extensionContext.extensionUri,
-					"resources",
-					s,
-				),
-			)
-			.toString();
+    const pathURL = (s: string) =>
+        webview.asWebviewUri(vscode.Uri.joinPath(extensionContext.extensionUri, "resources", s)).toString();
 
-	return contents
-		.replace(/@RES@\/([\w\-\.]+)/g, (f, fn) => pathURL(fn))
-		.replace("@ASSETURL@", assetUrl);
+    return contents.replace(/@RES@\/([\w\-\.]+)/g, (f, fn) => pathURL(fn));
 }
 
 async function readProjectJResAsync() {
-	const files = await findFilesAsync("jres", activeWorkspace().uri, false);
+    const files = await findFilesAsync("jres", activeWorkspace().uri, false);
+    const fileSystem: {[index: string]: string} = {};
 
-	const fileSystem: { [index: string]: string } = {};
+    for (const file of files) {
+        const contents = await readTextFileAsync(file);
+        fileSystem[vscode.workspace.asRelativePath(file)] = contents;
 
-	for (const file of files) {
-		const contents = await readTextFileAsync(file);
+        const pathParts = file.path.split(".");
+        const tsFile = file.with({
+            path: pathParts.slice(0, pathParts.length - 1).join(".") + ".ts"
+        });
 
-		fileSystem[vscode.workspace.asRelativePath(file)] = contents;
+        try {
+            const tsContents = await readTextFileAsync(tsFile);
+            fileSystem[vscode.workspace.asRelativePath(tsFile)] = tsContents;
+        }
+        catch (e) {
+            // file does not exist
+        }
 
-		const pathParts = file.path.split(".");
+        const gtsFile = file.with({
+            path: pathParts.slice(0, pathParts.length - 1).join(".") + ".ts"
+        });
 
-		const tsFile = file.with({
-			path: pathParts.slice(0, pathParts.length - 1).join(".") + ".ts",
-		});
+        try {
+            const gtsContents = await readTextFileAsync(gtsFile);
+            fileSystem[vscode.workspace.asRelativePath(gtsFile)] = gtsContents;
+        }
+        catch (e) {
+            // file does not exist
+        }
+    }
 
-		try {
-			const tsContents = await readTextFileAsync(tsFile);
-
-			fileSystem[vscode.workspace.asRelativePath(tsFile)] = tsContents;
-		} catch (e) {
-			// file does not exist
-		}
-
-		const gtsFile = file.with({
-			path: pathParts.slice(0, pathParts.length - 1).join(".") + ".ts",
-		});
-
-		try {
-			const gtsContents = await readTextFileAsync(gtsFile);
-
-			fileSystem[vscode.workspace.asRelativePath(gtsFile)] = gtsContents;
-		} catch (e) {
-			// file does not exist
-		}
-	}
-
-	return fileSystem;
+    return fileSystem;
 }
 
 async function readProjectPaletteAsync() {
-	const config = await readFileAsync("./pxt.json", "utf8");
-
-	const parsed = JSON.parse(config);
-
-	if (parsed.palette) return parsed.palette as string[];
+    const config = await readFileAsync("./pxt.json", "utf8");
+    const parsed = JSON.parse(config);
+    if (parsed.palette) return parsed.palette as string[];
 }
 
-async function saveFilesAsync(files: { [index: string]: string }) {
-	const config = await readFileAsync("./pxt.json", "utf8");
+async function saveFilesAsync(files: {[index: string]: string}) {
+    const config = await readFileAsync("./pxt.json", "utf8");
+    const parsed = JSON.parse(config);
+    const configFiles = parsed.files as string[];
+    let didChangeConfig = false;
 
-	const parsed = JSON.parse(config);
+    for (const file of Object.keys(files)) {
+        await writeFileAsync(file, files[file]);
 
-	const configFiles = parsed.files as string[];
+        if (configFiles.indexOf(file) === -1) {
+            insertGeneratedFile(configFiles, file);
+            didChangeConfig = true;
+        }
+    }
 
-	let didChangeConfig = false;
+    await writeFileAsync("./pxt.json", JSON.stringify(parsed, null, 4), "utf8");
+    await syncJResAsync();
 
-	for (const file of Object.keys(files)) {
-		await writeFileAsync(file, files[file]);
-
-		if (configFiles.indexOf(file) === -1) {
-			insertGeneratedFile(configFiles, file);
-
-			didChangeConfig = true;
-		}
-	}
-
-	await writeFileAsync("./pxt.json", JSON.stringify(parsed, null, 4), "utf8");
-
-	await syncJResAsync();
-
-	if (didChangeConfig) {
-		await vscode.commands.executeCommand(
-			"workbench.files.action.refreshFilesExplorer",
-		);
-	}
+    if (didChangeConfig) {
+        await vscode.commands.executeCommand("workbench.files.action.refreshFilesExplorer");
+    }
 }
 
 /**
@@ -391,33 +319,32 @@ async function saveFilesAsync(files: { [index: string]: string }) {
  * 4. Insert at the beginning of the array
  */
 export function insertGeneratedFile(arr: string[], toInsert: string) {
-	let lastGenIndex = -1;
+    let lastGenIndex = -1;
+    let lastJRESIndex = -1;
 
-	let lastJRESIndex = -1;
+    const basename = toInsert.split(".").slice(0, -1).join(".");
 
-	const basename = toInsert.split(".").slice(0, -1).join(".");
+    for (let i = 0; i < arr.length; i++) {
+        const currentBasename = arr[i].split(".").slice(0, -1).join(".");
 
-	for (let i = 0; i < arr.length; i++) {
-		const currentBasename = arr[i].split(".").slice(0, -1).join(".");
+        if (currentBasename === basename) {
+            arr.splice(i + 1, 0, toInsert);
+            return;
+        }
 
-		if (currentBasename === basename) {
-			arr.splice(i + 1, 0, toInsert);
+        const current = arr[i].toLowerCase();
+        if (current.endsWith(".g.ts") || current.endsWith(".g.jres")) {
+            lastGenIndex = i;
+        }
+        else if (current.endsWith(".jres")) {
+            lastJRESIndex = i;
+        }
+    }
 
-			return;
-		}
-
-		const current = arr[i].toLowerCase();
-
-		if (current.endsWith(".g.ts") || current.endsWith(".g.jres")) {
-			lastGenIndex = i;
-		} else if (current.endsWith(".jres")) {
-			lastJRESIndex = i;
-		}
-	}
-
-	if (lastGenIndex !== -1) {
-		arr.splice(lastGenIndex + 1, 0, toInsert);
-	} else {
-		arr.splice(lastJRESIndex + 1, 0, toInsert);
-	}
+    if (lastGenIndex !== -1) {
+        arr.splice(lastGenIndex + 1, 0, toInsert);
+    }
+    else {
+        arr.splice(lastJRESIndex + 1, 0, toInsert);
+    }
 }
