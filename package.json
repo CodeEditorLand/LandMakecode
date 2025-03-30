@@ -1,13 +1,36 @@
 {
 	"name": "pxt-vscode-web",
 	"displayName": "Microsoft MakeCode Arcade",
+	"version": "0.0.1",
+	"private": false,
 	"description": "Make games and learn code. Create retro arcade style video games, art, and music inside VS Code.",
+	"keywords": [
+		"codeeditorland",
+		"land",
+		"playform"
+	],
+	"homepage": "HTTPS://GitHub.Com/CodeEditorLand/LandMakecode#readme",
+	"bugs": {
+		"url": "HTTPS://GitHub.Com/CodeEditorLand/LandMakecode/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+HTTPS://github.com/CodeEditorLand/LandMakecode.git"
+	},
+	"license": "SEE LICENSE IN LICENSE",
+	"author": {
+		"name": "Source 🖋️ Open 👐🏻",
+		"email": "Source/Open@Editor.Land",
+		"url": "HTTPS://Editor.Land"
+	},
+	"type": "module",
 	"browser": "./dist/web/extension.js",
 	"scripts": {
 		"compile-web": "webpack",
 		"generate-l10n": "vscode-l10n-dev export --outDir ./l10n ./src",
 		"generate-l10n-ploc": "vscode-l10n-dev generate-pseudo -o ./l10n ./l10n/bundle.l10n.json ./package.nls.json",
 		"package-web": "webpack --mode production --devtool hidden-source-map",
+		"prepublishOnly": "Build 'Source/**/*.ts'",
 		"run-in-browser": "vscode-test-web --browserType=chromium --extensionDevelopmentPath=.",
 		"watch-web": "webpack --watch"
 	},
@@ -322,10 +345,14 @@
 		"path-browserify": "1.0.1"
 	},
 	"devDependencies": {
+		"@playform/build": "0.2.1",
 		"assert": "2.1.0",
 		"process": "0.11.10",
 		"ts-loader": "9.5.2",
 		"tslib": "2.8.1"
+	},
+	"publishConfig": {
+		"access": "public"
 	},
 	"icon": "media/logo-128x128.png",
 	"preview": false
