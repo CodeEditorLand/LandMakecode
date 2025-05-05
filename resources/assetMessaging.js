@@ -1,6 +1,6 @@
 (function () {
-	let frame;
-	let vscode = acquireVsCodeApi();
+    let frame;
+    let vscode = acquireVsCodeApi();
 
     window.addEventListener("message", function (m) {
         if (m.data._fromVscode) {
